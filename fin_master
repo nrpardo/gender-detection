@@ -1,0 +1,566 @@
+---
+title: "Untitled"
+author: "NURIA REDO"
+date: "24 de febrero de 2018"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+##################CONFIGURATION
+rm(list=ls())
+ls()
+memory.limit(70000)
+if (Sys.getenv("JAVA_HOME")!="")
+  Sys.setenv(JAVA_HOME="")
+Sys.setenv(JAVA_HOME='C:/Program Files/Java/jre1.8.0_161')
+options(stringsAsFactors = FALSE)
+.libPaths("F:/Program Files/R/R-3.4.3/library") 
+library(rJava)
+```
+```{r}
+###########IMPORTACION ARCHIVO Y EXPLORACION
+file <- read.csv("F:/NitroPC/Google Drive/BDATA/proyecto/gender-classifier-DFE-791531.csv/gender-classifier-DFE-791531.csv")
+#nos quedamos solo con las columnas que queremos
+file <- file[,c(1,6,7,11,12,14,15,17,18,19,20,22)]
+#exploramos los datos 
+summary(file)
+head(file[ ,1:5])
+dim(file)  #numero observaciones/columnas
+str(file) #cor(data
+#vamos a ver si hay un tweet por usuario
+length(unique(file$x_unit_id))   #hay un tweet por usuario.
+#Encoding
+library(stringi)
+stri_enc_mark(file$text)  #la mayoria son ASCII y alguna native
+```
+```{r}
+#en este caso  no nos importa que haya NA en segun que campos.
+#Vamos a ver si hemos de descartar o no
+sapply(file, function(x) sum(is.na(x)))
+
+#miramos valores unicos
+sapply(file,function(x) length(unique(x)))
+
+#convertir a minusculas los nombres de las columnas
+names(file) <-tolower(names(file))
+```
+```{r}
+#agrupamos por genero las observ vemos que tenemos: male, female, brand, en blanco
+library(plyr)
+library(dplyr)    
+file%>%
+  group_by(gender) %>% 
+  summarise(n=n())   
+```
+```{r}
+#Vamos a ver si todo el texto es en ingles. Ya que afecta a la hora de procesar el texto. 
+#Es una primera aproximacion, para m�s efectividad deberiamos limpiar el texto.
+library(textcat)
+my.profiles <- TC_byte_profiles[names(TC_byte_profiles)]
+file$language <- textcat(file$text,my.profiles )
+file%>%
+  group_by(language) %>% 
+  summarise(n=n())
+```
+```{r}
+#vemos si realmente las deteccion el idioma chino es real o es #erronea.Es erronea. Todo es Ingles
+#asi que trataremos todo de manera masiva. No hara falta separar por idiomas.
+
+filechinese <- subset(file, language =='chinese-big5')
+head(filechinese$text)
+```
+```{r}
+#convertimos el id numerico a caracter ya que no nos interesa que sea numerico
+file$x_unit_id <-as.character(file$x_unit_id)
+
+
+##################LIMPIEZA DE TEXTO############
+library(stringr)
+
+cleaning <- function(s){
+  s = tolower(s)  
+  s = gsub("(RT|via)((?:\\b\\W*@\\w+)+)", "", s) #remove retweets
+  s = gsub("@\\w+", "", s) #remove other screen names
+  s = gsub("[[:punct:]]", "", s) #remove punctuation
+  s = gsub("[[:digit:]]", "", s) #remove numbers
+  s = gsub("http\\w+", "", s) #remove links
+  s = gsub("https\\w+", "", s) #remove links
+  s = gsub("[ \t]{2,}", "", s) 
+  s = gsub("^\\s+|\\s+$", "", s) 
+  s = str_replace_all(s," "," ") #get rid of unnecessary spaces
+  s = trimws(s)
+  return(s)
+}
+#cleaning text and user description
+
+file$description <- cleaning(file$description)
+file$clean_tweet <- cleaning(file$text)
+file$clean_tweet <- iconv(file$clean_tweet, from = "latin1", to = "ascii", sub = "byte")
+file$description <- iconv(file$description, from = "latin1", to = "ascii", sub = "byte")
+file$name <-  cleaning(file$name)
+
+head(file$clean_tweet)
+```
+
+
+
+
+
+
+```{r}
+######## EXTRACT AAAA-UUUUU PATTERNS as "helloooooow"" is more common in female gender###########
+pattern <- c("aaa", "eee", "iii", "ooo", "uuu")
+file$rep_vowels<-str_detect(file$clean_tweet,pattern)
+file%>%
+  group_by(rep_vowels) %>% 
+  summarise(n=n())  
+```
+
+```{r}
+#no es una variable a tener en cuenta en esta muestra, solo ha encontrado 30 tuits con vocales repetidas. 
+file$rep_vowels <-NULL
+```
+
+```{r message=FALSE, warning=FALSE}
+#################EMOTICONOS Y EMOJIS##########
+
+#Extraemos los emoticonos del texto para ver si es una variable significativa en la prediccion
+
+library(qdapRegex)
+file$emoticon <-ex_emoticon(file$clean_tweet)
+file$clean_tweet<-rm_emoticon(file$clean_tweet)
+
+#sustituimos por si hay o no emoticon. 0-no hay  1-hay
+file %>%
+  plyr::mutate(emoticon =
+                 dplyr::case_when(file$emoticon  == " " ~ "0",
+                                  file$emoticon  != " " ~ "1",
+                                  TRUE                 ~ " 0"
+                 )) -> file
+file$emoticon <-as.factor(file$emoticon)
+
+
+
+#########emojis#################
+
+#extraemos los caracteres que son no ascii para detectar los emojis. 0-sin emojis 1-con emojis.
+#extrae algun texto al no haber espacios pero dado que el campo recoge unicamente si hay o no, no es una 
+#incidencia que nos afecte.
+file$emoji <-ex_non_ascii(file$clean_tweet, extract=T)
+
+file %>%
+  plyr::mutate(emoji =
+                 dplyr::case_when(file$emoji  != " " ~ "1",
+                                  TRUE               ~ "0"
+                 )) -> file
+
+file$emoji <-as.factor(file$emoji)
+```
+
+```{r message=FALSE, warning=FALSE}
+##########COLOR VALUES####################
+
+#vamos a convertir en num�rico los campos sidebar_color y link_color, somos las mujeres de rosa y los hombres de negro?
+#para ello creo un diccionario de colores en base a los colores existentes en el dataset.
+
+#creamos el diccionario de colores propio.
+library(data.table)
+bar <-data.table(unique(file$sidebar_color))
+str(bar)
+link <-data.table(unique(file$link_color))
+#unimos los colores y quitamos los duplicados con la funcion unique y creamos el id numerico
+color <-unique(rbind(bar,link))
+color$id_color <-seq.int(nrow(color))
+
+#substitute colors by id number
+library(dplyr)
+library(gdata)
+file <- merge(file, color, by.x='sidebar_color', by.y='V1', all.x=TRUE)
+file$sidebar_color <-file$id_color
+file <- merge(file, color, by.x='link_color', by.y='V1', all.x=TRUE)
+file$link_color <-file$id_color.y
+
+file <- file[ ,!names(file) %in%c("id_color.y","id_color.x")]
+```
+```{r}
+################COVERT GENDER TO VALUES##########
+
+file %>%
+  plyr::mutate(gender =
+                 dplyr::case_when(file$gender  == "male"   ~ "0",
+                                  file$gender  == "female" ~ "1",
+                                  file$gender  == "brand"  ~ "2",
+                                  )) -> file
+levels(as.factor(file$gender))
+
+################PREDICT GENDER WITH NAMES##############
+
+#genderizeR package funcionaria perfecto pero tenemos la limitacion de la API por lo que buscaremos alguna otra alternativa
+library(qdapDictionaries)
+library(fuzzyjoin)
+#name. A first name.
+names
+#. gender2. Gender of the combined male/female list with "B" in place of overlapping (M/F)
+#. pred.sex. Predicted gender of the names with B's in gender2 replaced with the gender that
+#had a higher per.freq
+names <- data.table(NAMES_SEX)
+names$name <-tolower(names$name)
+names$lenght <-nchar(names$name)
+names <-names[names$lenght>3] #filtramos para limitar un poco el matching 
+names$gender_by_name <- ifelse(names$pred.sex == "F", 1, 0)
+str(names)
+names <-names[ ,c(1,5)]
+```
+```{r message=FALSE, warning=FALSE}
+#incorporamos algunas palabras que se identifican con el genero:
+
+dictionary <-data.frame('name'=c("dad","daddy","mum","mummy","mr","mrs","pretty","man", "woman","miss","mister"),
+             'gender_by_name'=c(0,0,1,1,0,1,1,0,1,1,0))
+         
+names <- rbind(names,dictionary)
+
+file<-regex_left_join(file,names, by='name', ignore_case=FALSE)
+
+file%>%
+  group_by(gender_by_name) %>% 
+  summarise(n=n())   
+#nos ha casado  un 56% de los datos con uno de los nombres de la tabla. 
+#vemos tambien como se han incrementado los registros ya que ha casado mas de un nombre con el username.
+#ya veremos posteriormente si el hecho de tener un nombre de usuario u otro ayuda a la prediccion del genero.
+```
+
+```{r}
+##############POS TAGGING################
+#existe la libraria Korpus, spacy. Finalmente he elegido udpipe, por su rapidez 
+#no tiene el problema de memoria que he encontrado en Korpus y no depende de tener instalado spaCy en Python.
+library(data.table)
+library(koRpus)
+library(openNLP)
+library(NLP)
+library(openNLPdata)
+library(reticulate)
+library(udpipe)
+library(tibble)
+#gc()
+t <-file$clean_tweet
+model <- udpipe_download_model(language = "english")
+model
+udmodel_english <- udpipe_load_model(file = "english-ud-2.0-170801.udpipe")
+c<- udpipe_annotate(udmodel_english,t)
+d <- as.data.frame(c)
+str(d)
+e <- document_term_frequencies(d[, c("doc_id", "upos")])
+f <- document_term_matrix(e)
+g <-as.data.frame(as.matrix(f))
+rownames(g) <- as.numeric(sub("doc","", rownames(g)))
+file <-cbind(file, g)
+
+#gc()
+```
+
+```{r}
+###########ESTUDIO SENTIMIENTO EN EL TEXTO#####################
+#########################SENTIMENT ANALYSIS EN BASE A TEXTO###################
+library(NLP)
+library(tm)
+library(SentimentAnalysis)
+
+documents <-file$clean_tweet
+# Analyze sentiment
+file$sentiment <- analyzeSentiment(documents)
+corps<- VCorpus(VectorSource(file$clean_tweet))
+corps <- tm_map(corps, removeWords,stopwords('english'))
+sent <- analyzeSentiment(corps)
+sent$SentimentQDAP
+
+# View sentiment direction (i.e. negative=1, neutral,=2 positive=3)
+file$sent2 <-as.factor(convertToDirection(sent$SentimentGI))
+file[, levels(file$sent2) <- c(1, 2, 3)]
+```
+
+```{r}
+#############FREQUENT WORDS BY GENDER
+#tomamos una muestra que recoja usuarios con confianza >0.8 y gender= (0,1)
+library(RColorBrewer)
+library(NLP)
+library(tm)
+
+file$gender <- as.numeric(file$gender)
+filegender <-file[file$gender%in%c(0,1) & file$gender.confidence > 0.6 ,]
+str(file)
+male_file <- filegender[filegender$gender == 0,]
+female_file <- filegender[filegender$gender == 1,]
+
+WordFreq <- function(d){
+  d = Corpus(VectorSource(d))
+  d <- tm_map(d,removeWords,stopwords('english'))
+  tdm <- TermDocumentMatrix(d)
+  m <- as.matrix(tdm)
+  v <- sort(rowSums(m),decreasing=TRUE)
+  d <- data.frame(word = names(v),freq=v)
+  return(d)
+}
+male_words = WordFreq(male_file$clean_tweet)
+female_words = WordFreq(female_file$clean_tweet)
+```
+
+```{r}
+#We will calculate the probablity of gender (male in this case) given a words i.e. P(Gender | word)
+
+all_words = merge(x = male_words, y = female_words, by = "word", all = TRUE)
+
+colnames(all_words) <- c("word", "freq_m", "freq_f")
+
+all_words[is.na(all_words)] <- 0
+
+all_words$sum = all_words$freq_m + all_words$freq_f
+
+all_words$male_prob_words = all_words$freq_m/all_words$sum
+all_words$female_prob_words = all_words$freq_f/all_words$sum
+
+d = Corpus(VectorSource(file$clean_tweet))
+d <- tm_map(d, removeWords,stopwords('english'))
+tdm <- TermDocumentMatrix(d)
+library(tidytext)
+DF <- tidy(tdm)
+max(as.numeric(DF$document))
+DF <- DF[DF$term %in% all_words$word,]
+merged_set <- merge(x = DF, y = all_words, by.x = "term", by.y = "word")
+sapply(merged_set, class)
+merged_set$document <- as.numeric(merged_set$document)
+merged_set = merged_set[order(order(merged_set$document)),]
+max(merged_set$document)
+aggr = aggregate(cbind(freq_m, sum) ~ document, data = merged_set, sum)
+aggr$male_prob_words = aggr$freq_m / aggr$sum
+max(aggr$document)
+file$x_unit_id = 1:nrow(file)
+filegender$x_unit_id = 1:nrow(filegender)
+file <- merge(file, aggr, by.x = "x_unit_id", by.y = "document", all.x = T)
+filegender <- merge(filegender, aggr, by.x = "x_unit_id", by.y = "document", all.x = T)
+file$gender_bywords = ifelse(file$male_prob_words >0.5, 1, 0)
+filegender$gender_bywords = ifelse(filegender$male_prob_words >= 0.5, 1, 0)
+```
+
+```{r}
+######SAVE TO USE IN TABLEAU#########
+# gender 0=mujer 1=hombre
+str(filegender)
+file <-data.frame(subset(file,select=-c(sentiment)),unclass(file$sentiment))
+filegender <-data.frame(subset(filegender,select=-c(sentiment)),unclass(filegender$sentiment))
+#write.csv2(file,"F:/NitroPC/Google Drive/BDATA/proyecto/gender-classifier-DFE-791531.csv/file.txt", na="")
+#write.csv2(filegender,"F:/NitroPC/Google Drive/BDATA/proyecto/gender-classifier-DFE-791531.csv/filegender.txt")
+#write.csv2(male_words,"F:/NitroPC/Google Drive/BDATA/proyecto/gender-classifier-DFE-791531.csv/male_words.txt") 
+#write.csv2(female_words,"F:/NitroPC/Google Drive/BDATA/proyecto/gender-classifier-DFE-791531.csv/female_words.txt")
+#write.csv2(color,"F:/NitroPC/Google Drive/BDATA/proyecto/gender-classifier-DFE-791531.csv/color.txt")
+```
+
+```{r}
+##############################CORRELATIN MATRIX##########{}
+library(corrplot)
+library(RColorBrewer)
+str(filegender)
+sapply(file, class)
+
+filegender$sent2 <-as.numeric(filegender$sent2)
+filegender$emoticon <-as.numeric(filegender$emoticon)
+filegender$emoji <-as.numeric(filegender$emoji)
+filegendernumeric <-select_if(filegender, is.numeric)
+res <-cor(filegendernumeric, method = "pearson", use = "complete.obs")
+res <-corrplot(res,type = "upper", method="circle", number.font=2, tl.cex=0.6)
+```
+```{r}
+gender <- cor(filegendernumeric, method = 'pearson', use = 'pairwise.complete.obs')[4,-4]
+gender
+
+#write.csv2(res,"F:/NitroPC/Google Drive/BDATA/proyecto/gender-classifier-DFE-791531.csv/correlationmatrix.txt")
+
+#parece que el color del link (0,10), el hecho que haya emojis(0.137) y el nombre de usuario(gender_by_name) (0.43) son las variables m�s correlacionadas con el g�nero de usuario.
+#con la prediccion de genero por palabras usadas (0.19276),pero tampoco lo alta que cabria esperar.
+```
+
+```{r}
+#vamos a ver si con la predicci�n por usuario o por las palabras encontramos alguna variable m�s que este correlacionada.
+#no vemos ninguna m�s significativa de las anteriores encontradas.
+#gender_by_name <-cor(filegendernumeric, method = 'pearson', use = 'pairwise.complete.obs')[11,-11]
+#gender_by_name
+```
+
+```{r}
+#gender_by_words <-cor(filegendernumeric, method = 'pearson', use = 'pairwise.complete.obs')[33,-33]
+#gender_by_words
+```
+
+
+```{r}
+################MODELO SUPERVISADO###################
+library(knitr)
+#clusterizacion
+filegender_m <-filegender%>%select(-1,-3,-(5:14),-17,-(37:39), -(42:54))
+filegender_m <-na.omit(filegender_m )
+filegender_m <- filegender_m %>% mutate_if(is.numeric,as.factor)
+
+set.seed(1234) 
+library(dplyr)
+gender_train<-sample_frac(filegender_m, 0.65)
+sid<-as.numeric(rownames(gender_train)) # because rownames() returns character
+gender_test<-gender_train[-sid,]
+str(gender_train)
+
+#check de split
+prop.table(table(gender_train$gender))
+prop.table(table(gender_test$gender))
+
+set.seed(1234)
+kmeans_clust <- kmeans(filegender_m, 2)
+kmeans_clust
+table(filegender_m$gender, kmeans_clust$cluster)
+```
+
+```{r}
+#  No queda muy claro a que cluster corresponde cada g�nero. Vamos a ver si lo vemos mejor gr�ficamente.
+#PLOT
+library(ggplot2)
+ggplot(filegender_m, aes(gender_by_name, link_color, color =gender))+geom_point()
+kmeans_clust$centers
+#unimos en la tabla final
+filegender_m_clust <-filegender_m%>% mutate(cluster_id = kmeans_clust$cluster)
+kable(head(filegender_m_clust))
+```
+
+```{r}
+#Parece que el custer 1 corresponde mas a mujeres y el cluster 2 a hombres pero este segundo no esta del todo claro.
+#######MODELO DE APRENDIZAJE NO SUPERVISADO####MODELO CLASIFICACION########
+
+##NAIVES BAYES
+library(e1071)
+library(gmodels)
+
+#Fitting the Naive Bayes model
+gender_model <- naiveBayes(gender ~., gender_train)
+#gender_model
+#What does the model say? Print the model summary
+gender_pred <-predict(gender_model,gender_train)
+CrossTable(gender_pred, gender_train[,3], prop.chisq =FALSE, proc.c= FALSE, prop.r=FALSE, dnn =c('actual_gender', 'predicted_gender'))
+```
+
+```{r}
+##EVALUATION MODEL PERFORMANCE
+library(gmodels)
+gender_pred_test <-predict(gender_model, gender_test)
+
+CrossTable(gender_pred_test, gender_test[,3], prop.chisq =FALSE, proc.c= FALSE, prop.r=FALSE, dnn =c('actual_gender', 'predicted_gender'))
+```
+
+```{r}
+###PREDICCION DE GENDER EN TODO EL DATASET.
+gender_pred_file <- predict(gender_model, filegender_m)
+
+CrossTable(gender_pred_file, filegender_m[,3], prop.chisq =FALSE, proc.c= FALSE, prop.r=FALSE, dnn =c('actual_gender', 'predicted_gender'))
+
+table(gender_pred_file, filegender_m$gender)
+```
+
+
+
+```{r}
+######ANEXO#
+#Dejo en este anexo el estudio de los emojis. La idea era contarlos, no extraerlos tal y como he dejado. No me ha casado con el encoding a pesar de haber cambiado el default encoding. Lo dejo indicado como 
+
+################ESTUDIO SENTIMIENTO EN BASE A EMOJIS##############
+
+#load dictionary function
+
+load_dict_emoji <- function(emoji_file = "emojis.csv"){
+  # Download emoji_file if it does not exist
+  if (!file.exists(emoji_file)) {
+    emoji_file <- "emojis.csv"
+    emoji_file_url <-
+      paste0(
+        "https://raw.githubusercontent.com/today-is-a-good-day/emojis/master/",
+        emoji_file)
+    
+    download.file(emoji_file_url, destfile = emoji_file)
+  }
+  
+  readr::read_delim(
+    emoji_file,
+    delim = ";",
+    col_names = c("number","unicode","EN", "ES", "tag", "utf8","ftu8"),
+    skip = 1,
+    progress = FALSE
+  ) %>%
+    mutate(EN = tolower(EN)) %>%
+    rename(description = EN, descripcion_espanyol=ES, r.encoding = ftu8)
+}
+
+#cargamos el diccionari de emojis con la descripcion, r.encoding, descripcion
+EmDict_raw<-load_dict_emoji()
+
+#limpiamos descripciones
+# plain skin tones
+skin_tones <- c("light skin tone", 
+                "medium-light skin tone", 
+                "medium skin tone",
+                "medium-dark skin tone", 
+                "dark skin tone")
+
+# remove plain skin tones and remove skin tone info in description
+library(Unicode)
+emDict <- EmDict_raw %>%
+  # remove plain skin tones emojis
+  filter(!description %in% skin_tones) %>%
+  # remove emojis with skin tones info, e.g. remove woman: light skin tone and only
+  # keep woman
+  filter(!grepl(":", description)) %>%
+  mutate(description = tolower(description))%>%
+  mutate(unicode = as.u_char(unicode))
+
+#nos quedamos solo con descripcion, r.encoding, unicode, utf8
+#emDict <- emDict%>% select(description, r.encoding, unicode, utf8)
+emDict$description <- cleaning(emDict$description)
+matchto <- emDict$r.encoding
+description <- emDict$description
+
+
+# this function outputs the emojis found in a string as well as their occurences
+count_matches <- function(string, matchto, description, sentiment = NA) {
+  
+  vec <- str_count(string, matchto)
+  matches <- which(vec != 0)
+  
+  descr <- NA
+  cnt <- NA
+  
+  if (length(matches) != 0) {
+    
+    descr <- description[matches]
+    cnt <- vec[matches]
+    
+  }
+df <- data.frame(text = string, description = descr, count = cnt)
+  
+  return(df)
+  
+}
+
+# this function applies count_matches on a vector o texts and outputs a data.frame
+emojis_matching <- function(texts, matchto, description, sentiment = NA) {
+  
+  texts %>% 
+    lapply(count_matches, matchto = matchto, description = description, sentiment = sentiment) %>%
+    bind_rows
+  }
+
+tweets <- emojis_matching(file$clean_tweet, matchto, description) %>% 
+  group_by(text) %>% 
+  summarise(n = sum(count)) %>%
+  #merge(file, by.y = "clean_tweet", by.x="text") %>% 
+  merge(file, by="text") %>% 
+  select(text,n) %>%
+  arrange(-n)
+```
+
